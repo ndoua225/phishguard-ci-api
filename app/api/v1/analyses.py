@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.agent.template_explainer import TEMPLATE_VERSION, generate_explanation
 from app.api.v1.auth import get_current_user
@@ -23,7 +24,7 @@ from app.schemas.analysis import (
 )
 from app.services.quota_service import check_analysis_quota, record_analysis_usage
 
-router = APIRouter(prefix="/analyses", tags=["analyses"])
+router = APIRouter(tags=["analyses"])
 
 
 @router.post("", response_model=AnalysisResponse, status_code=status.HTTP_201_CREATED)
@@ -145,6 +146,7 @@ async def list_analyses(
     """List user's analyses."""
     result = await db.execute(
         select(Analysis)
+        .options(selectinload(Analysis.results))
         .where(Analysis.user_id == current_user.id)
         .order_by(desc(Analysis.created_at))
         .limit(limit)
@@ -179,7 +181,9 @@ async def get_analysis(
 ) -> AnalysisResponse:
     """Get a specific analysis by reference."""
     result = await db.execute(
-        select(Analysis).where(
+        select(Analysis)
+        .options(selectinload(Analysis.results))
+        .where(
             Analysis.analysis_ref == str(analysis_ref),
             Analysis.user_id == current_user.id,
         )

@@ -33,7 +33,7 @@ __all__ = [
     "router",
 ]
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(tags=["auth"])
 
 
 class RegisterRequest(BaseModel):

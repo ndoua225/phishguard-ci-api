@@ -14,7 +14,7 @@ from app.api.v1.auth import get_current_user, require_admin
 from app.db.session import get_session_dependency
 from app.models import ActivityLog, Analysis, ApiUsage, User, UserRole
 
-router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+router = APIRouter(tags=["dashboard"])
 
 
 @router.get("/user/stats")
