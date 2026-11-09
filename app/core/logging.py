@@ -82,6 +82,50 @@ def configure_logging() -> None:
     root_logger = logging.getLogger()
     root_logger.addFilter(SensitiveDataFilter())
 
+    def sensitive_data_processor(
+        logger: Any, method_name: str, event_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Filter sensitive data from structlog event dict."""
+        # Fields that indicate a value is likely a secret (key-based detection)
+        sensitive_key_patterns: set[str] = {
+            "password", "password_hash", "secret_key", "token", "access_token",
+            "refresh_token", "csrf_token", "session_token", "totp_secret",
+            "mfa_code", "authorization", "cookie", "secret", "key", "pin", "otp",
+            "code", "jwt", "bearer", "api_key", "private_key", "api_secret",
+        }
+        
+        # Values that are likely secrets (value-based detection for long strings)
+        def looks_like_secret(value: str) -> bool:
+            if not isinstance(value, str):
+                return False
+            # JWT tokens (3 parts separated by dots)
+            if value.count('.') == 2 and len(value) > 50:
+                return True
+            # Base64-like strings that are long
+            if len(value) >= 32 and all(c.isalnum() or c in '+/=' for c in value):
+                return True
+            # Hex strings that are long
+            if len(value) >= 32 and all(c in '0123456789abcdefABCDEF' for c in value):
+                return True
+            return False
+        
+        def redact_value(key: str, value: Any) -> Any:
+            if isinstance(value, str):
+                key_lower = key.lower()
+                # Key-based detection
+                for field in sensitive_key_patterns:
+                    if field in key_lower:
+                        return "[REDACTED]"
+                # Value-based detection for likely secrets
+                if looks_like_secret(value):
+                    return "[REDACTED]"
+            return value
+        
+        redacted: dict[str, Any] = {}
+        for key, value in event_dict.items():
+            redacted[key] = redact_value(key, value)
+        return redacted
+
     # Configure structlog
     structlog.configure(
         processors=[
@@ -90,6 +134,7 @@ def configure_logging() -> None:
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
+            sensitive_data_processor,  # type: ignore[list-item]
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
