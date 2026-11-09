@@ -142,7 +142,115 @@ async function login(email: string, password: string, mfaCode?: string) {
 }
 ```
 
-### 4.3 Déconnexion
+### 4.3 Configuration MFA (Admin uniquement)
+
+```typescript
+// hooks/useMFA.ts
+interface MFASetupResponse {
+  secret: string;           // Secret chiffré (Fernet) - pour stockage si besoin
+  provisioning_uri: string; // URI otpauth:// pour QR code
+}
+
+interface MFAVerifyResponse {
+  mfa_enabled: boolean;
+  message: string;
+}
+
+async function setupMFA(): Promise<MFASetupResponse> {
+  const response = await api.post('/auth/mfa/setup', {});
+  return response.data;
+}
+
+async function verifyMFA(code: string): Promise<MFAVerifyResponse> {
+  const response = await api.post('/auth/mfa/verify', { code });
+  return response.data;
+}
+
+async function disableMFA(code: string): Promise<MFAVerifyResponse> {
+  const response = await api.post('/auth/mfa/disable', { code });
+  return response.data;
+}
+```
+
+**Flux MFA complet côté frontend :**
+
+```typescript
+// components/MFASetup.tsx
+export function MFASetup() {
+  const [qrUri, setQrUri] = useState<string | null>(null);
+  const [code, setCode] = useState('');
+  const [step, setStep] = useState<'setup' | 'verify'>('setup');
+  const [error, setError] = useState<string | null>(null);
+  const [lockedUntil, setLockedUntil] = useState<Date | null>(null);
+
+  const handleSetup = async () => {
+    try {
+      setError(null);
+      const { provisioning_uri } = await setupMFA();
+      setQrUri(provisioning_uri);
+      setStep('verify');
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Erreur setup MFA');
+    }
+  };
+
+  const handleVerify = async () => {
+    try {
+      setError(null);
+      const result = await verifyMFA(code);
+      if (result.mfa_enabled) {
+        // MFA activé avec succès
+        onMFAEnabled();
+      }
+    } catch (err: any) {
+      const detail = err.response?.data?.detail;
+      if (err.response?.status === 429) {
+        // Compte verrouillé - extraire retry-after
+        const retryAfter = err.response.headers['retry-after'];
+        setLockedUntil(new Date(Date.now() + (retryAfter ? retryAfter * 1000 : 15 * 60 * 1000)));
+      }
+      setError(detail || 'Code invalide');
+    }
+  };
+
+  if (step === 'setup') {
+    return (
+      <button onClick={handleSetup} disabled={lockedUntil && lockedUntil > new Date()}>
+        Initialiser MFA
+      </button>
+    );
+  }
+
+  return (
+    <div>
+      {qrUri && (
+        <div>
+          <p>Scannez ce QR code avec votre application TOTP (Google Authenticator, Authy, etc.)</p>
+          <img src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrUri)}`} alt="MFA QR Code" />
+          <p>Secret chiffré (backup) : {qrUri.split('secret=')[1]?.split('&')[0]}</p>
+        </div>
+      )}
+      <input 
+        type="text" 
+        value={code} 
+        onChange={e => setCode(e.target.value)} 
+        placeholder="Code à 6 chiffres"
+        maxLength={6}
+        disabled={lockedUntil && lockedUntil > new Date()}
+      />
+      {lockedUntil && lockedUntil > new Date() && (
+        <p className="text-red-500">Compte verrouillé. Réessayez dans {Math.ceil((lockedUntil.getTime() - Date.now()) / 60000)} min.</p>
+      )}
+      {error && <p className="text-red-500">{error}</p>}
+      <button onClick={handleVerify} disabled={!code || (lockedUntil && lockedUntil > new Date())}>
+        Vérifier et activer MFA
+      </button>
+    </div>
+  );
+}
+```
+
+### 4.4 Déconnexion
 
 ```typescript
 async function logout() {

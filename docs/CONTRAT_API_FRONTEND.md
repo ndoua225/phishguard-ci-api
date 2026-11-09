@@ -601,7 +601,102 @@ Origines autorisées (config `PHISHGUARD_CORS_ORIGINS`) :
 
 ---
 
-## 9. Endpoints résumé
+## 9. MFA (Admin uniquement)
+
+### 9.1 Initialiser MFA
+**POST** `/auth/mfa/setup`
+
+**Auth :** Bearer token ou cookie `session` (rôle `ADMIN` ou `SUPER_ADMIN` requis)
+
+**Request :** `{}` (corps vide)
+
+**Response 200 :**
+```json
+{
+  "secret": "ENCRYPTED_BASE64_STRING",
+  "provisioning_uri": "otpauth://totp/PhishGuard%20CI:admin%40example.com?secret=BASE32_SECRET&issuer=PhishGuard%20CI"
+}
+```
+
+**Description :**
+- Génère un nouveau secret TOTP chiffré (Fernet/AES-128-GCM)
+- Retourne le secret chiffré (pour stockage côté client si besoin) et l'URI de provisioning pour QR code
+- Le secret est stocké chiffré en base, MFA **non activé** tant que `/mfa/verify` n'est pas appelé
+- Le secret retourné est déjà chiffré ; le frontend ne doit pas le déchiffrer
+
+**Erreurs :**
+- `403` : Rôle insuffisant (USER non autorisé)
+- `400` : MFA déjà activé
+
+---
+
+### 9.2 Vérifier code MFA et activer
+**POST** `/auth/mfa/verify`
+
+**Auth :** Bearer token ou cookie `session` (rôle `ADMIN` ou `SUPER_ADMIN` requis)
+
+**Request :**
+```json
+{
+  "code": "123456"
+}
+```
+
+**Response 200 :**
+```json
+{
+  "mfa_enabled": true,
+  "message": "MFA enabled successfully"
+}
+```
+
+**Description :**
+- Vérifie le code TOTP (fenêtre de tolérance ±1 step = ±30s)
+- Si valide : active MFA, remet compteur d'échecs à 0, supprime verrouillage
+- Si invalide : incrémente `failed_mfa_attempts` ; à 5 échecs → `mfa_locked_until = now() + 15 min` (retour `429`)
+
+**Erreurs :**
+- `403` : Rôle insuffisant
+- `400` : Setup non initié ou MFA déjà activé
+- `429` : Compte verrouillé (trop d'échecs, attendre 15 min)
+- `401` : Code invalide
+
+---
+
+### 9.3 Désactiver MFA
+**POST** `/auth/mfa/disable`
+
+**Auth :** Bearer token ou cookie `session` (rôle `ADMIN` ou `SUPER_ADMIN` requis)
+
+**Request :**
+```json
+{
+  "code": "123456"
+}
+```
+
+**Response 200 :**
+```json
+{
+  "mfa_enabled": false,
+  "message": "MFA disabled successfully"
+}
+```
+
+**Description :**
+- Vérifie le code TOTP avant désactivation
+- Si valide : désactive MFA, efface `totp_secret`, remet compteurs à 0
+- Si invalide : même logique de verrouillage que `/mfa/verify` (5 essais → 15 min)
+
+**Erreurs :**
+- `403` : Rôle insuffisant
+- `400` : MFA non activé
+- `429` : Compte verrouillé
+- `401` : Code invalide
+
+---
+
+## 10. Endpoints résumé
 
 | Méthode | Endpoint | Auth | Rôle | Description |
 |---|---|---|---|---|
@@ -612,6 +707,9 @@ Origines autorisées (config `PHISHGUARD_CORS_ORIGINS`) :
 | GET | `/auth/me` | Bearer/Cookie | User | Profil |
 | GET | `/auth/me/quota` | Bearer/Cookie | User | Quota |
 | DELETE | `/auth/me/sessions` | Cookie+CSRF | User | Révoquer sessions |
+| POST | `/auth/mfa/setup` | Bearer/Cookie | Admin | Initialiser MFA (retourne secret + QR URI) |
+| POST | `/auth/mfa/verify` | Bearer/Cookie | Admin | Vérifier code et activer MFA |
+| POST | `/auth/mfa/disable` | Bearer/Cookie | Admin | Vérifier code et désactiver MFA |
 | POST | `/analyses` | Bearer/Cookie+CSRF | User | Créer analyse |
 | GET | `/analyses` | Bearer/Cookie | User | Lister analyses |
 | GET | `/analyses/{ref}` | Bearer/Cookie | User | Détail analyse |

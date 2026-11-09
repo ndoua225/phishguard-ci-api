@@ -98,9 +98,142 @@ curl -X POST https://api.phishguard-ci.example.com/api/v1/auth/login \
   }'
 ```
 
+**Réponse 200 :** (même structure que connexion standard)
+
+**Erreur 403 (MFA non configuré) :**
+```json
+{ "detail": "MFA not configured for admin account. Contact super admin." }
+```
+
+**Erreur 401 (MFA manquant) :**
+```json
+{ "detail": "MFA code required for admin accounts" }
+```
+
+**Erreur 401 (MFA invalide) :**
+```json
+{ "detail": "Invalid MFA code" }
+```
+
 ---
 
-### 1.4 Déconnexion
+### 1.4 MFA Setup (Admin uniquement)
+
+**Requête :**
+```bash
+curl -X POST https://api.phishguard-ci.example.com/api/v1/auth/mfa/setup \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Réponse 200 :**
+```json
+{
+  "secret": "gAAAAABl7...", 
+  "provisioning_uri": "otpauth://totp/PhishGuard%20CI:admin%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=PhishGuard%20CI"
+}
+```
+
+**Notes :**
+- Le `secret` retourné est **chiffré** (Fernet) — ne pas tenter de le déchiffrer côté frontend
+- Le `provisioning_uri` contient le secret en clair (base32) pour générer le QR code
+- MFA non activé tant que `/mfa/verify` n'est pas appelé avec un code valide
+
+**Erreur 403 :**
+```json
+{ "detail": "MFA setup only available for admin accounts" }
+```
+
+**Erreur 400 :**
+```json
+{ "detail": "MFA already enabled" }
+```
+
+---
+
+### 1.5 MFA Verify — Activer MFA (Admin uniquement)
+
+**Requête :**
+```bash
+curl -X POST https://api.phishguard-ci.example.com/api/v1/auth/mfa/verify \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "123456"
+  }'
+```
+
+**Réponse 200 :**
+```json
+{
+  "mfa_enabled": true,
+  "message": "MFA enabled successfully"
+}
+```
+
+**Erreur 400 (setup non fait) :**
+```json
+{ "detail": "MFA setup not initiated" }
+```
+
+**Erreur 400 (déjà activé) :**
+```json
+{ "detail": "MFA already enabled" }
+```
+
+**Erreur 429 (verrouillé) :**
+```json
+{ "detail": "Too many failed MFA attempts. Please try again later." }
+```
+**Header :** `Retry-After: 900` (secondes restantes)
+
+**Erreur 401 (code invalide) :**
+```json
+{ "detail": "Invalid MFA code" }
+```
+
+---
+
+### 1.6 MFA Disable — Désactiver MFA (Admin uniquement)
+
+**Requête :**
+```bash
+curl -X POST https://api.phishguard-ci.example.com/api/v1/auth/mfa/disable \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "123456"
+  }'
+```
+
+**Réponse 200 :**
+```json
+{
+  "mfa_enabled": false,
+  "message": "MFA disabled successfully"
+}
+```
+
+**Erreur 400 (non activé) :**
+```json
+{ "detail": "MFA not enabled" }
+```
+
+**Erreur 429 (verrouillé) :**
+```json
+{ "detail": "Too many failed MFA attempts. Please try again later." }
+```
+**Header :** `Retry-After: 900`
+
+**Erreur 401 (code invalide) :**
+```json
+{ "detail": "Invalid MFA code" }
+```
+
+---
+
+### 1.7 Déconnexion
 
 ```bash
 curl -X POST https://api.phishguard-ci.example.com/api/v1/auth/logout \

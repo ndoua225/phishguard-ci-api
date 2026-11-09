@@ -190,30 +190,184 @@ api.interceptors.response.use(
 
 ---
 
-## 5. MFA (Admin uniquement)
+## 5. MFA (Admin uniquement) — Implémentation complète
 
-### 5.1 Actuel (placeholder)
+### 5.1 Architecture MFA
 
+- **Algorithme :** TOTP (RFC 6238) — HMAC-SHA1, 30s step, 6 chiffres
+- **Chiffrement secret :** Fernet (AES-128-GCM) — clé dédiée `PHISHGUARD_TOTP_ENCRYPTION_KEY`
+- **Stockage :** Secret chiffré en base (`totp_secret` VARCHAR(255)), jamais en clair
+- **Rôles concernés :** `ADMIN`, `SUPER_ADMIN` uniquement
+- **Protection rate limiting :** 5 échecs → verrouillage 15 min (`mfa_locked_until`)
+
+### 5.2 Endpoints MFA
+
+#### 5.2.1 Initialiser MFA — `POST /auth/mfa/setup`
+
+```http
+POST /api/v1/auth/mfa/setup
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{}
+```
+
+**Permissions :** `ADMIN` ou `SUPER_ADMIN` requis
+
+**Réponse 200 :**
 ```json
-// Login request admin
 {
-  "email": "admin@example.com",
-  "password": "password",
-  "mfa_code": "123456"  // Requis si rôle ADMIN/SUPER_ADMIN
+  "secret": "gAAAAABl...",           // Secret TOTP chiffré (Fernet, base64)
+  "provisioning_uri": "otpauth://totp/PhishGuard%20CI:admin%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=PhishGuard%20CI"
 }
 ```
 
-### 5.2 Roadmap MFA
+**Description :**
+- Génère un nouveau secret TOTP (base32)
+- Le chiffre avec Fernet avant stockage en base
+- Retourne le secret **chiffré** + URI provisioning pour QR code
+- MFA **non activé** (`mfa_enabled=false`) tant que `/mfa/verify` n'est pas appelé avec code valide
 
-| Étape | Description |
-|---|---|
-| Actuel | Code MFA requis mais non vérifié (placeholder) |
-| v1.1 | TOTP (RFC 6238) avec QR code setup |
-| v1.2 | Codes de secours / WebAuthn |
+**Erreurs :**
+| Code | Cause |
+|------|-------|
+| `403` | Rôle `USER` (non admin) |
+| `400` | MFA déjà activé |
 
 ---
 
-## 5. Verrouillage compte
+#### 5.2.2 Vérifier et activer MFA — `POST /auth/mfa/verify`
+
+```http
+POST /api/v1/auth/mfa/verify
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "code": "123456"
+}
+```
+
+**Permissions :** `ADMIN` ou `SUPER_ADMIN` requis
+
+**Réponse 200 :**
+```json
+{
+  "mfa_enabled": true,
+  "message": "MFA enabled successfully"
+}
+```
+
+**Logique de vérification :**
+1. Vérifie que `mfa_locked_until` n'est pas dans le futur (sinon `429`)
+2. Déchiffre `totp_secret` avec Fernet
+3. Vérifie code TOTP (fenêtre ±1 step = ±30s)
+4. Si **valide** : `mfa_enabled=true`, `failed_mfa_attempts=0`, `mfa_locked_until=null`
+5. Si **invalide** : `failed_mfa_attempts++` ; si ≥5 → `mfa_locked_until=now()+15min`, retour `429`
+
+**Erreurs :**
+| Code | Cause |
+|------|-------|
+| `403` | Rôle `USER` |
+| `400` | Setup non initié (`totp_secret` null) ou MFA déjà activé |
+| `429` | Verrouillé (5 échecs, attendre 15 min) |
+| `401` | Code invalide |
+
+---
+
+#### 5.2.3 Désactiver MFA — `POST /auth/mfa/disable`
+
+```http
+POST /api/v1/auth/mfa/disable
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "code": "123456"
+}
+```
+
+**Permissions :** `ADMIN` ou `SUPER_ADMIN` requis
+
+**Réponse 200 :**
+```json
+{
+  "mfa_enabled": false,
+  "message": "MFA disabled successfully"
+}
+```
+
+**Logique :**
+1. Vérifie `mfa_locked_until` (sinon `429`)
+2. Déchiffre `totp_secret`, vérifie code TOTP
+3. Si **valide** : `mfa_enabled=false`, `totp_secret=null`, compteurs remis à 0
+4. Si **invalide** : même logique verrouillage que `/mfa/verify`
+
+**Erreurs :**
+| Code | Cause |
+|------|-------|
+| `403` | Rôle `USER` |
+| `400` | MFA non activé |
+| `429` | Verrouillé |
+| `401` | Code invalide |
+
+---
+
+### 5.3 Connexion admin avec MFA
+
+```http
+POST /api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "admin@example.com",
+  "password": "password",
+  "mfa_code": "123456"
+}
+```
+
+**Logique :**
+1. Vérifie email/mot de passe
+2. Si rôle `ADMIN`/`SUPER_ADMIN` :
+   - Si `mfa_enabled=false` → `403` "MFA not configured"
+   - Si `mfa_code` manquant → `401` "MFA code required"
+   - Si code invalide → `401` "Invalid MFA code"
+3. Crée session avec `is_mfa_verified=true`
+
+---
+
+### 5.4 Variables d'environnement MFA
+
+```env
+# Clé de chiffrement Fernet (32 bytes url-safe base64 = 44 chars)
+# Générer avec : python -c "import base64; print(base64.urlsafe_b64encode(b'x'*32).decode())"
+PHISHGUARD_TOTP_ENCRYPTION_KEY=MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+
+# Clé JWT (distincte, min 32 chars)
+PHISHGUARD_SECRET_KEY=cle-jwt-separee-tres-longue-et-securisee
+
+# Optionnel : fenêtre de tolérance TOTP (défaut 1 step = ±30s)
+# PHISHGUARD_TOTP_VALID_WINDOW=1
+```
+
+---
+
+### 5.5 Sécurité MFA
+
+| Mesure | Implémentation |
+|--------|----------------|
+| Chiffrement secret | Fernet (AES-128-GCM) authentifié |
+| Clé séparée JWT | `PHISHGUARD_TOTP_ENCRYPTION_KEY` ≠ `PHISHGUARD_SECRET_KEY` |
+| Clé hors dépôt | Variable d'env seulement, jamais en dur |
+| Rate limiting | 5 essais → 15 min verrouillage persistant (DB) |
+| Concurrence | Compteur atomique en DB (transaction) |
+| Activation confirmée | Seulement après code TOTP valide |
+| Désactivation confirmée | Seulement après code TOTP valide |
+| Journalisation | Événements `MFA_SETUP`, `MFA_VERIFY`, `MFA_DISABLE` dans `activity_logs` (sans secrets) |
+
+---
+
+## 6. Verrouillage compte (Login)
 
 | Échecs consécutifs | Action |
 |---|---|
