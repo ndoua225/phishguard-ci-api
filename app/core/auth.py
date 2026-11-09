@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
 import pyotp
+from cryptography.fernet import Fernet
 from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -18,6 +20,65 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.session import get_session_dependency
 from app.models import Session, User, UserRole
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# TOTP secret encryption
+_totp_fernet: Fernet | None = None
+
+
+def _get_totp_fernet() -> Fernet:
+    """Get or create the Fernet instance for TOTP secret encryption."""
+    global _totp_fernet
+    if _totp_fernet is None:
+        key_b64 = settings.totp_encryption_key
+        # Fernet expects the key as a url-safe base64-encoded string (44 chars)
+        # Validate it's a valid Fernet key
+        if len(key_b64) != 44:
+            raise ValueError("TOTP encryption key must be 44-character url-safe base64")
+        try:
+            # Validate it's valid base64
+            base64.urlsafe_b64decode(key_b64.encode() + b"=" * (-len(key_b64) % 4))
+        except Exception:
+            raise ValueError("TOTP encryption key must be valid url-safe base64")
+        _totp_fernet = Fernet(key_b64.encode())
+    return _totp_fernet
+
+
+def encrypt_totp_secret(secret: str) -> str:
+    """Encrypt a TOTP secret for storage.
+    
+    Args:
+        secret: The plaintext TOTP secret (base32 encoded)
+        
+    Returns:
+        The encrypted secret as a url-safe base64 string
+    """
+    fernet = _get_totp_fernet()
+    encrypted = fernet.encrypt(secret.encode())
+    return encrypted.decode()
+
+
+def decrypt_totp_secret(encrypted_secret: str) -> str:
+    """Decrypt a TOTP secret from storage.
+    
+    Args:
+        encrypted_secret: The encrypted secret from storage
+        
+    Returns:
+        The decrypted plaintext TOTP secret
+        
+    Raises:
+        ValueError: If decryption fails (invalid key or corrupted data)
+    """
+    fernet = _get_totp_fernet()
+    try:
+        decrypted = fernet.decrypt(encrypted_secret.encode())
+        return decrypted.decode()
+    except Exception as e:
+        raise ValueError(f"Failed to decrypt TOTP secret: {e}")
+
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -265,31 +326,42 @@ async def delete_all_user_sessions(db: AsyncSession, user_id: UUID) -> int:
 # TOTP (Time-based One-Time Password) for Admin MFA
 
 def generate_totp_secret() -> str:
-    """Generate a new TOTP secret for MFA enrollment."""
-    return pyotp.random_base32()
+    """Generate a new TOTP secret for MFA enrollment (encrypted for storage)."""
+    plaintext_secret = pyotp.random_base32()
+    return encrypt_totp_secret(plaintext_secret)
 
 
-def get_totp_provisioning_uri(email: str, secret: str) -> str:
-    """Generate TOTP provisioning URI for QR code."""
-    return pyotp.totp.TOTP(secret).provisioning_uri(
+def get_totp_provisioning_uri(email: str, encrypted_secret: str) -> str:
+    """Generate TOTP provisioning URI for QR code.
+    
+    Args:
+        email: User's email
+        encrypted_secret: The encrypted TOTP secret from storage
+        
+    Returns:
+        Provisioning URI for QR code generation
+    """
+    plaintext_secret = decrypt_totp_secret(encrypted_secret)
+    return pyotp.totp.TOTP(plaintext_secret).provisioning_uri(
         name=email,
         issuer_name="PhishGuard CI",
     )
 
 
-def verify_totp_code(secret: str, code: str, valid_window: int = 1) -> bool:
+def verify_totp_code(encrypted_secret: str, code: str, valid_window: int = 1) -> bool:
     """
     Verify a TOTP code.
 
     Args:
-        secret: The user's TOTP secret
+        encrypted_secret: The user's encrypted TOTP secret from storage
         code: The code provided by the user
         valid_window: Number of time steps (30s each) to check before/after current
 
     Returns:
         True if code is valid, False otherwise
     """
-    totp = pyotp.TOTP(secret)
+    plaintext_secret = decrypt_totp_secret(encrypted_secret)
+    totp = pyotp.TOTP(plaintext_secret)
     return totp.verify(code, valid_window=valid_window)
 
 

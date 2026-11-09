@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
 
+    # TOTP Encryption
+    totp_encryption_key: str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+
     # CORS
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
@@ -57,6 +60,38 @@ class Settings(BaseSettings):
             raise PydanticCustomError(
                 "value_error",
                 "PHISHGUARD_SECRET_KEY must be at least 32 characters",
+            )
+        return v
+
+    @field_validator("totp_encryption_key")
+    @classmethod
+    def validate_totp_encryption_key(cls, v: str, info: Any) -> str:
+        """Ensure totp_encryption_key is not the default in production."""
+        default = "dev-totp-encryption-key-change-in-production"
+        if v == default:
+            # Allow default only in development/test environments
+            env = info.data.get("environment") if info.data else "development"
+            if env != "development" and env != "test":
+                from pydantic_core import PydanticCustomError
+                raise PydanticCustomError(
+                    "value_error",
+                    "PHISHGUARD_TOTP_ENCRYPTION_KEY must be set and cannot be the default value in production",
+                )
+        # Fernet key must be 32 url-safe base64-encoded bytes (44 chars)
+        if len(v) != 44:
+            from pydantic_core import PydanticCustomError
+            raise PydanticCustomError(
+                "value_error",
+                "PHISHGUARD_TOTP_ENCRYPTION_KEY must be a valid Fernet key (44 characters)",
+            )
+        try:
+            import base64
+            base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
+        except Exception:
+            from pydantic_core import PydanticCustomError
+            raise PydanticCustomError(
+                "value_error",
+                "PHISHGUARD_TOTP_ENCRYPTION_KEY must be valid url-safe base64",
             )
         return v
 

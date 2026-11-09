@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -378,15 +378,29 @@ async def mfa_verify(
             detail="MFA already enabled",
         )
 
+    # Check if account is locked due to too many failed MFA attempts
+    if current_user.mfa_locked_until and current_user.mfa_locked_until > datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed MFA attempts. Please try again later.",
+        )
+
     if not verify_totp_code(current_user.totp_secret or "", request.code):
+        # Increment failed attempts
+        current_user.failed_mfa_attempts += 1
+        if current_user.failed_mfa_attempts >= 5:
+            current_user.mfa_locked_until = datetime.now(UTC) + timedelta(minutes=15)
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid MFA code",
         )
 
-        # Enable MFA
-        current_user.mfa_enabled = True
-        await db.commit()
+    # Enable MFA and reset failed attempts
+    current_user.mfa_enabled = True
+    current_user.failed_mfa_attempts = 0
+    current_user.mfa_locked_until = None
+    await db.commit()
 
     return MFAVerifyResponse(mfa_enabled=True, message="MFA enabled successfully")
 
@@ -411,14 +425,21 @@ async def mfa_disable(
         )
 
     if not verify_totp_code(current_user.totp_secret or "", request.code):
+        # Increment failed attempts
+        current_user.failed_mfa_attempts += 1
+        if current_user.failed_mfa_attempts >= 5:
+            current_user.mfa_locked_until = datetime.now(UTC) + timedelta(minutes=15)
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid MFA code",
         )
 
-        # Disable MFA and clear secret
-        current_user.mfa_enabled = False
-        current_user.totp_secret = None
-        await db.commit()
+    # Disable MFA and clear secret
+    current_user.mfa_enabled = False
+    current_user.totp_secret = None
+    current_user.failed_mfa_attempts = 0
+    current_user.mfa_locked_until = None
+    await db.commit()
 
     return MFADisableResponse(mfa_enabled=False, message="MFA disabled successfully")
