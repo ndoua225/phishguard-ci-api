@@ -1,3 +1,6 @@
+from typing import Any
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +37,28 @@ class Settings(BaseSettings):
 
     # TemplateExplainer
     template_version: str = "1.0.0"
+
+    @field_validator("secret_key")
+    @classmethod
+    def validate_secret_key(cls, v: str, info: Any) -> str:
+        """Ensure secret_key is not the default in production."""
+        default = "dev-secret-key-change-in-production"
+        if v == default:
+            # Allow default only in development/test environments
+            env = info.data.get("environment") if info.data else "development"
+            if env != "development" and env != "test":
+                from pydantic_core import PydanticCustomError
+                raise PydanticCustomError(
+                    "value_error",
+                    "PHISHGUARD_SECRET_KEY must be set and cannot be the default value in production",
+                )
+        if len(v) < 32:
+            from pydantic_core import PydanticCustomError
+            raise PydanticCustomError(
+                "value_error",
+                "PHISHGUARD_SECRET_KEY must be at least 32 characters",
+            )
+        return v
 
     model_config = SettingsConfigDict(
         env_file=".env",

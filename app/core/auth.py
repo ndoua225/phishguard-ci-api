@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
+import pyotp
 from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -261,6 +262,37 @@ async def delete_all_user_sessions(db: AsyncSession, user_id: UUID) -> int:
     return len(sessions)
 
 
+# TOTP (Time-based One-Time Password) for Admin MFA
+
+def generate_totp_secret() -> str:
+    """Generate a new TOTP secret for MFA enrollment."""
+    return pyotp.random_base32()
+
+
+def get_totp_provisioning_uri(email: str, secret: str) -> str:
+    """Generate TOTP provisioning URI for QR code."""
+    return pyotp.totp.TOTP(secret).provisioning_uri(
+        name=email,
+        issuer_name="PhishGuard CI",
+    )
+
+
+def verify_totp_code(secret: str, code: str, valid_window: int = 1) -> bool:
+    """
+    Verify a TOTP code.
+
+    Args:
+        secret: The user's TOTP secret
+        code: The code provided by the user
+        valid_window: Number of time steps (30s each) to check before/after current
+
+    Returns:
+        True if code is valid, False otherwise
+    """
+    totp = pyotp.TOTP(secret)
+    return totp.verify(code, valid_window=valid_window)
+
+
 def set_auth_cookies(
     response: Response,
     session_token: str,
@@ -295,3 +327,49 @@ def clear_auth_cookies(response: Response) -> None:
     """Clear authentication cookies."""
     response.delete_cookie(key="session", path="/")
     response.delete_cookie(key="csrf_token", path="/")
+
+
+async def validate_csrf_token(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_session_dependency)],
+) -> None:
+    """
+    Validate CSRF token from request header against session cookie.
+
+    This dependency should be used on all state-changing endpoints that
+    authenticate via session cookies (not Bearer tokens).
+
+    If the request uses Bearer token authentication, CSRF validation is skipped.
+    """
+    # Check if request uses Bearer token authentication
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        # Bearer token auth - CSRF not needed
+        return
+
+    # Get session token from cookie
+    session_token = request.cookies.get("session")
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session required for CSRF validation",
+        )
+
+    # Get CSRF token from header (set by frontend from csrf_token cookie)
+    csrf_token = request.headers.get("X-CSRF-Token")
+    if not csrf_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CSRF token required (X-CSRF-Token header)",
+        )
+
+    # Validate session and CSRF token
+    session = await validate_session(db, session_token, csrf_token)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or expired CSRF token",
+        )
+
+    # Attach session to request state for convenience
+    request.state.session = session

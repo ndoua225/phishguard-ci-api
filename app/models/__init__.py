@@ -110,6 +110,9 @@ class User(Base):
     locked_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # MFA fields
+    totp_secret: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mfa_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     # Relationships
     analyses: Mapped[list[Analysis]] = relationship(

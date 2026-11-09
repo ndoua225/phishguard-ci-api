@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -11,16 +13,26 @@ from fastapi.responses import JSONResponse
 
 from app.api.v1 import analyses, auth, dashboard
 from app.config import settings
+from app.core.logging import (
+    configure_logging,
+    get_logger,
+    log_request_response,
+    request_id_var,
+)
 from app.db.session import close_db, init_db, set_test_engine
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
     """Create FastAPI application with optional test database override.
-    
+
     Args:
         database_url: Optional database URL for testing. If None, uses settings.database_url.
     """
-    
+
+    # Configure structured logging
+    configure_logging()
+    logger = get_logger(__name__)
+
     @asynccontextmanager
     async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Startup
@@ -28,10 +40,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
             # Set up test engine
             set_test_engine(database_url)
         await init_db()
+        logger.info("application_startup", environment=settings.environment)
         yield
         # Shutdown
         await close_db()
-    
+        logger.info("application_shutdown")
+
     app = FastAPI(
         title=settings.app_name,
         version="0.1.0",
@@ -50,6 +64,62 @@ def create_app(database_url: str | None = None) -> FastAPI:
         allow_headers=["*"],
         expose_headers=["X-Request-ID"],
     )
+
+    # Request logging middleware
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next: Callable[[Request], Awaitable[JSONResponse]]) -> JSONResponse:
+        # Generate or extract request ID
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id_var.set(request_id)
+
+        start_time = time.perf_counter()
+
+        # Get user ID if authenticated (from Bearer token)
+        user_id = None
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            # We don't decode here to avoid overhead; user_id will be added in logs if needed
+            pass
+
+        # Log request
+        logger.info(
+            "http_request_start",
+            method=request.method,
+            path=request.url.path,
+            request_id=request_id,
+        )
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(
+                "http_request_error",
+                method=request.method,
+                path=request.url.path,
+                request_id=request_id,
+                duration_ms=round(duration_ms, 2),
+                error_type=type(exc).__name__,
+            )
+            raise
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
+        # Add request ID to response headers
+        response.headers["X-Request-ID"] = request_id
+
+        # Log response
+        await log_request_response(
+            logger=logger,
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=round(duration_ms, 2),
+            request_id=request_id,
+            user_id=user_id,
+        )
+
+        return response
 
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next: Callable[[Request], Awaitable[JSONResponse]]) -> JSONResponse:

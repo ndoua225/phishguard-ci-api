@@ -17,11 +17,16 @@ from app.core.auth import (
     create_user_session,
     delete_all_user_sessions,
     delete_session,
+    generate_totp_secret,
     get_current_user,
+    get_totp_provisioning_uri,
     hash_password,
     require_admin,
+    require_super_admin,
     set_auth_cookies,
+    validate_csrf_token,
     verify_password,
+    verify_totp_code,
 )
 from app.db.session import get_session_dependency
 from app.models import User, UserRole
@@ -30,6 +35,11 @@ from app.services.quota_service import get_user_quota_status
 __all__ = [
     "get_current_user",
     "require_admin",
+    "require_super_admin",
+    "validate_csrf_token",
+    "generate_totp_secret",
+    "get_totp_provisioning_uri",
+    "verify_totp_code",
     "router",
 ]
 
@@ -45,6 +55,39 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
     mfa_code: str | None = None
+
+
+class MFASetupRequest(BaseModel):
+    """Request to initiate MFA setup."""
+    pass
+
+
+class MFASetupResponse(BaseModel):
+    """Response with TOTP secret and provisioning URI."""
+    secret: str
+    provisioning_uri: str
+
+
+class MFAVerifyRequest(BaseModel):
+    """Request to verify MFA code."""
+    code: str
+
+
+class MFAVerifyResponse(BaseModel):
+    """Response after MFA verification."""
+    mfa_enabled: bool
+    message: str
+
+
+class MFADisableRequest(BaseModel):
+    """Request to disable MFA."""
+    code: str
+
+
+class MFADisableResponse(BaseModel):
+    """Response after MFA disable."""
+    mfa_enabled: bool
+    message: str
 
 
 class TokenResponse(BaseModel):
@@ -131,16 +174,30 @@ async def login(
             detail="Account is disabled",
         )
 
-    # MFA check for admins (placeholder - implement TOTP if needed)
+    # MFA check for admins with TOTP
     mfa_verified = True
     if user.role in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        if not user.mfa_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="MFA not configured for admin account. Contact super admin.",
+            )
         if not request.mfa_code:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="MFA code required for admin accounts",
             )
-        # TODO: Verify TOTP code
-        mfa_verified = True  # Placeholder
+        if not user.totp_secret or not verify_totp_code(user.totp_secret, request.mfa_code):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA code",
+            )
+        mfa_verified = True
+    elif user.role == UserRole.USER:
+        # Regular users don't need MFA
+        mfa_verified = True
+    else:
+        mfa_verified = True
 
     # Create session
     session_token, csrf_token = await create_user_session(
@@ -168,6 +225,7 @@ async def logout(
     response: Response,
     http_request: Request,
     db: AsyncSession = Depends(get_session_dependency),
+    _csrf: None = Depends(validate_csrf_token),
 ) -> dict[str, str]:
     """Logout and clear session."""
     # Get session from cookie
@@ -255,8 +313,112 @@ async def revoke_all_sessions(
     response: Response,
     db: AsyncSession = Depends(get_session_dependency),
     current_user: User = Depends(get_current_user),
+    _csrf: None = Depends(validate_csrf_token),
 ) -> dict[str, str]:
     """Revoke all sessions for current user."""
     count = await delete_all_user_sessions(db, current_user.id)
     clear_auth_cookies(response)
     return {"message": f"Revoked {count} sessions"}
+
+
+# MFA endpoints for admin accounts
+
+@router.post("/mfa/setup", response_model=MFASetupResponse)
+async def mfa_setup(
+    request: Request,
+    db: AsyncSession = Depends(get_session_dependency),
+    current_user: User = Depends(get_current_user),
+) -> MFASetupResponse:
+    """Initiate MFA setup for admin account. Returns secret and provisioning URI."""
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MFA setup only available for admin accounts",
+        )
+
+    if current_user.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA already enabled",
+        )
+
+    # Generate new TOTP secret
+    secret = generate_totp_secret()
+    provisioning_uri = get_totp_provisioning_uri(current_user.email, secret)
+
+    # Store secret temporarily (not enabled until verified)
+    current_user.totp_secret = secret
+    await db.commit()
+
+    return MFASetupResponse(secret=secret, provisioning_uri=provisioning_uri)
+
+
+@router.post("/mfa/verify", response_model=MFAVerifyResponse)
+async def mfa_verify(
+    request: MFAVerifyRequest,
+    db: AsyncSession = Depends(get_session_dependency),
+    current_user: User = Depends(get_current_user),
+) -> MFAVerifyResponse:
+    """Verify MFA code and enable MFA."""
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MFA only available for admin accounts",
+        )
+
+    if not current_user.totp_secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA setup not initiated",
+        )
+
+    if current_user.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA already enabled",
+        )
+
+    if not verify_totp_code(current_user.totp_secret or "", request.code):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid MFA code",
+        )
+
+        # Enable MFA
+        current_user.mfa_enabled = True
+        await db.commit()
+
+    return MFAVerifyResponse(mfa_enabled=True, message="MFA enabled successfully")
+
+
+@router.post("/mfa/disable", response_model=MFADisableResponse)
+async def mfa_disable(
+    request: MFADisableRequest,
+    db: AsyncSession = Depends(get_session_dependency),
+    current_user: User = Depends(get_current_user),
+) -> MFADisableResponse:
+    """Disable MFA after verifying code."""
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MFA only available for admin accounts",
+        )
+
+    if not current_user.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA not enabled",
+        )
+
+    if not verify_totp_code(current_user.totp_secret or "", request.code):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid MFA code",
+        )
+
+        # Disable MFA and clear secret
+        current_user.mfa_enabled = False
+        current_user.totp_secret = None
+        await db.commit()
+
+    return MFADisableResponse(mfa_enabled=False, message="MFA disabled successfully")
