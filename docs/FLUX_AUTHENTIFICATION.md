@@ -455,3 +455,173 @@ VITE_REFRESH_TOKEN_TTL_DAYS=7
 ---
 
 *Document généré pour l'intégration frontend — PhishGuard CI Backend v0.1.0*
+
+---
+
+## 9. Procédure de récupération MFA (Admin)
+
+### 9.1 Contexte et principes
+
+La récupération MFA est une procédure **exceptionnelle**, **contrôlée** et **auditée** pour les comptes `ADMIN` ou `SUPER_ADMIN` ayant perdu l'accès à leur application TOTP (téléphone perdu, application supprimée, etc.).
+
+**Principes de sécurité :**
+- **Aucune route API de désactivation MFA par un tiers** — pas d'endpoint `POST /admin/users/{id}/mfa/disable`
+- **Nécessite une vérification d'identité forte** (hors bande)
+- **Traçabilité complète** dans `activity_logs`
+- **Révocation de l'ancien secret** + réenrôlement obligatoire
+- **Approbation `SUPER_ADMIN` requise** pour les comptes `ADMIN`
+- **Auto-récupération impossible** pour `SUPER_ADMIN` (procédure hors bande)
+
+---
+
+### 9.2 Scénarios de récupération
+
+| Scénario | Acteur demandeur | Approbateur | Procédure |
+|----------|------------------|-------------|-----------|
+| Admin perd TOTP | Admin concerné | SUPER_ADMIN | Demande via canal sécurisé (email pro, ticket ITSM) |
+| SUPER_ADMIN perd TOTP | SUPER_ADMIN concerné | Aucun (procédure hors bande) | Intervention DB directe + audit trail |
+
+---
+
+### 9.3 Procédure standard : Admin → SUPER_ADMIN
+
+#### Étape 1 : Demande formelle
+L'admin contacte le SUPER_ADMIN via canal vérifié (email professionnel, Slack/Teams vérifié, ticket ITSM avec numéro) :
+- Identifiant du compte (email)
+- Justification (perte téléphone, réinitialisation app, etc.)
+- Confirmation qu'aucun accès suspect n'a été détecté
+
+#### Étape 2 : Vérification d'identité par le SUPER_ADMIN
+Le SUPER_ADMIN valide :
+- [ ] Email professionnel correspondant au compte
+- [ ] Canal de communication vérifié (pas de DM non vérifié)
+- [ ] Aucune activité suspecte récente sur le compte (vérifier `activity_logs`)
+- [ ] Demande tracée dans système de ticket (ITSM) avec référence
+
+#### Étape 3 : Exécution récupération (par SUPER_ADMIN)
+
+**Option A — Via interface d'administration (si développée) :**
+```http
+POST /api/v1/dashboard/admin/users/{user_id}/mfa/recovery
+Authorization: Bearer <super_admin_token>
+X-CSRF-Token: <csrf_token>
+Content-Type: application/json
+
+{
+  "ticket_ref": "ITSM-2026-11-0042",
+  "reason": "Perte téléphone - réinitialisation Google Authenticator"
+}
+```
+
+**Option B — Via script SQL direct (actuel, pas d'endpoint API) :**
+```sql
+-- 1. Journaliser l'opération AVANT modification
+INSERT INTO activity_logs (user_id, event_type, event_metadata, ip_hash, created_at)
+VALUES (
+  'uuid-admin-concerne',
+  'MFA_RECOVERY_INITIATED',
+  '{"initiated_by": "uuid-super-admin", "ticket_ref": "ITSM-2026-11-0042", "reason": "Perte téléphone"}',
+  'hash-ip-super-admin',
+  NOW()
+);
+
+-- 2. Révoquer l'ancien secret et désactiver MFA
+UPDATE users
+SET mfa_enabled = false,
+    totp_secret = NULL,
+    failed_mfa_attempts = 0,
+    mfa_locked_until = NULL,
+    updated_at = NOW()
+WHERE id = 'uuid-admin-concerne' AND role = 'ADMIN';
+
+-- 3. Journaliser la réussite
+INSERT INTO activity_logs (user_id, event_type, event_metadata, ip_hash, created_at)
+VALUES (
+  'uuid-admin-concerne',
+  'MFA_RECOVERY_COMPLETED',
+  '{"initiated_by": "uuid-super-admin", "ticket_ref": "ITSM-2026-11-0042"}',
+  'hash-ip-super-admin',
+  NOW()
+);
+```
+
+#### Étape 4 : Réenrôlement par l'admin
+1. L'admin se connecte avec email/mot de passe (sans MFA car désactivé)
+2. Appelle `POST /auth/mfa/setup` → nouveau secret + QR code
+3. Scanne QR code dans nouvelle application TOTP
+4. Appelle `POST /auth/mfa/verify` avec code → MFA réactivé
+
+#### Étape 5 : Confirmation et clôture
+- SUPER_ADMIN vérifie dans `activity_logs` que `MFA_VERIFY` a suivi `MFA_RECOVERY_COMPLETED`
+- Clôture du ticket ITSM avec référence aux logs d'audit
+
+---
+
+### 9.4 Procédure d'urgence : SUPER_ADMIN
+
+**Aucun endpoint API ni interface** — intervention directe en base par DBA autorisé :
+
+```sql
+-- 1. Journaliser (si possible via application, sinon manuel dans ticket)
+-- 2. Révoquer
+UPDATE users
+SET mfa_enabled = false,
+    totp_secret = NULL,
+    failed_mfa_attempts = 0,
+    mfa_locked_until = NULL
+WHERE id = 'uuid-super-admin' AND role = 'SUPER_ADMIN';
+
+-- 3. Créer entrée d'audit manuelle dans activity_logs
+INSERT INTO activity_logs (user_id, event_type, event_metadata, ip_hash, created_at)
+VALUES (
+  'uuid-super-admin',
+  'MFA_RECOVERY_SUPER_ADMIN',
+  '{"reason": "Perte TOTP SUPER_ADMIN", "executed_by": "dba-authorized", "ticket_ref": "ITSM-2026-11-0099"}',
+  'hash-ip-dba',
+  NOW()
+);
+```
+
+**Exigences post-intervention :**
+- Double vérification par un second DBA ou responsable sécurité
+- Ticket ITSM avec signatures numériques des deux validateurs
+- Rotation de la clé `PHISHGUARD_TOTP_ENCRYPTION_KEY` recommandée si compromis suspecté
+- Rapport d'incident sécurité sous 24h
+
+---
+
+### 9.5 Journalisation d'audit
+
+Tous les événements MFA sont tracés dans `activity_logs` :
+
+| Event Type | Description | Métadonnées clés |
+|------------|-------------|------------------|
+| `MFA_SETUP` | Initialisation MFA | `provisioning_uri` (sans secret) |
+| `MFA_VERIFY` | Activation MFA réussie | `mfa_enabled: true` |
+| `MFA_VERIFY_FAILED` | Échec vérification | `failed_attempts`, `locked_until` |
+| `MFA_DISABLE` | Désactivation MFA volontaire | `mfa_enabled: false` |
+| `MFA_DISABLE_FAILED` | Échec désactivation | `failed_attempts`, `locked_until` |
+| `MFA_RECOVERY_INITIATED` | Demande récupération | `initiated_by`, `ticket_ref`, `reason` |
+| `MFA_RECOVERY_COMPLETED` | Récupération effectuée | `initiated_by`, `ticket_ref` |
+| `MFA_RECOVERY_SUPER_ADMIN` | Récupération SUPER_ADMIN | `executed_by`, `ticket_ref` |
+
+**Champs sensibles JAMAIS logués :**
+- `totp_secret` (chiffré ou non)
+- Codes TOTP
+- `provisioning_uri` complet (contient secret en clair) — tronqué ou hashé
+
+---
+
+### 9.6 Checklist de sécurité récupération MFA
+
+| Contrôle | Implémentation |
+|----------|----------------|
+| Aucune route API tierce | Pas d'endpoint `/admin/users/{id}/mfa/disable` |
+| Vérification identité | Canal pro vérifié + ticket ITSM |
+| Approbation SUPER_ADMIN | Requise pour récupération ADMIN |
+| Révocation ancien secret | `totp_secret = NULL` obligatoire |
+| Réenrôlement forcé | Nouveau `MFA_SETUP` → `MFA_VERIFY` |
+| Audit trail complet | `activity_logs` avec `event_type` MFA_* |
+| Pas de secrets en logs | `totp_secret`, codes TOTP exclus |
+| Rotation clé si compromis | Procédure documentée (voir §9.4) |
+| Double validation SUPER_ADMIN | Deux validateurs pour urgence |
