@@ -16,8 +16,8 @@ from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy import insert, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -367,8 +367,9 @@ async def create_user_session(
 
 async def delete_session(db: AsyncSession, session_token: str) -> bool:
     """Delete a session."""
+    token_hash = hash_token(session_token)
     result = await db.execute(
-        select(Session).where(Session.session_token == session_token)
+        select(Session).where(Session.session_token_hash == token_hash)
     )
     session = result.scalar_one_or_none()
 
@@ -515,22 +516,19 @@ async def revoke_family(db: AsyncSession, family_id: UUID, reason: str) -> int:
     count = 0
     for session in sessions:
         if session.refresh_token_hash:
-            # Use try/except for cross-database unique constraint handling
-            try:
-                await db.execute(
-                    insert(RevokedRefreshToken).values(
-                        token_hash=session.refresh_token_hash,
-                        user_id=session.user_id,
-                        family_id=family_id,
-                        revoked_reason=reason,
-                        original_expires_at=session.family_expires_at,
-                    )
-                )
-                await db.flush()
-                count += 1
-            except IntegrityError:
-                # Already revoked - skip
-                await db.rollback()
+            # Use PostgreSQL ON CONFLICT DO NOTHING for atomicity
+            stmt = pg_insert(RevokedRefreshToken).values(
+                token_hash=session.refresh_token_hash,
+                user_id=session.user_id,
+                family_id=family_id,
+                revoked_reason=reason,
+                original_expires_at=session.family_expires_at,
+            )
+            stmt = stmt.on_conflict_do_nothing(index_elements=["token_hash"])
+            await db.execute(stmt)
+            await db.flush()
+            count += 1
+        await db.delete(session)
     await db.flush()
     return count
 
@@ -620,60 +618,44 @@ async def rotate_refresh_token(
 
     # 5. Atomic rotation (use existing transaction)
     # a) Blacklist old refresh token (idempotent with unique constraint)
-    # Use try/except IntegrityError for cross-database portability (SQLite + PostgreSQL)
+    # Use PostgreSQL ON CONFLICT DO NOTHING for true atomicity
     
-    # Check if already revoked (replay detection) - this is the fast path
-    existing = await db.execute(
-        select(RevokedRefreshToken).where(RevokedRefreshToken.token_hash == hash_token(old_refresh_token))
-    )
-    if existing.scalar_one_or_none():
-        # Already revoked - replay detected, revoke entire family
-        await revoke_family(db, family_id, "REPLAY")
-        return RefreshResult.REPLAY_DETECTED, None, None, None, None
-
     # Insert into blacklist with idempotent upsert
-    # Use try/except for cross-database unique constraint handling
-    try:
-        await db.execute(
-            insert(RevokedRefreshToken).values(
-                token_hash=hash_token(old_refresh_token),
-                user_id=user.id,
-                family_id=family_id,
-                revoked_reason="ROTATION",
-                original_expires_at=session.family_expires_at,
-            )
-        )
-        await db.flush()
-    except IntegrityError:
-        # Unique constraint violation - another request beat us to it
-        await db.rollback()
-        # Check if it was a ROTATION (legitimate race) or REPLAY (attack)
-        check = await db.execute(
-            select(RevokedRefreshToken).where(RevokedRefreshToken.token_hash == hash_token(old_refresh_token))
-        )
-        revoked_entry: RevokedRefreshToken | None = check.scalar_one_or_none()
-        if revoked_entry and revoked_entry.revoked_reason == "ROTATION":
-            # Another request just rotated this token - legitimate race
-            return RefreshResult.ALREADY_CONSUMED, None, None, None, None
-        elif revoked_entry and revoked_entry.revoked_reason == "REPLAY":
-            # Actual replay attack detected
-            await revoke_family(db, family_id, "REPLAY")
-            return RefreshResult.REPLAY_DETECTED, None, None, None, None
-        # Unknown state - treat as already consumed
-        return RefreshResult.ALREADY_CONSUMED, None, None, None, None
+    # Use PostgreSQL dialect-specific ON CONFLICT for true atomicity
+    stmt = pg_insert(RevokedRefreshToken).values(
+        token_hash=hash_token(old_refresh_token),
+        user_id=user.id,
+        family_id=family_id,
+        revoked_reason="ROTATION",
+        original_expires_at=session.family_expires_at,
+    )
+    stmt = stmt.on_conflict_do_nothing(index_elements=["token_hash"])
+    await db.execute(stmt)
+    await db.flush()
 
-    # Verify the insert succeeded
+    # Verify the insert result by checking the blacklist
+    # If another committed request beat us, the entry will exist with REPLAY or ROTATION reason
     check = await db.execute(
         select(RevokedRefreshToken).where(RevokedRefreshToken.token_hash == hash_token(old_refresh_token))
     )
-    revoked_after_insert: RevokedRefreshToken | None = check.scalar_one_or_none()
-    if revoked_after_insert and revoked_after_insert.revoked_reason == "ROTATION":
-        # Insert succeeded
-        pass
-    elif revoked_after_insert and revoked_after_insert.revoked_reason == "REPLAY":
-        # Shouldn't happen but handle it
-        await revoke_family(db, family_id, "REPLAY")
-        return RefreshResult.REPLAY_DETECTED, None, None, None, None
+    revoked_entry: RevokedRefreshToken | None = check.scalar_one_or_none()
+    
+    if revoked_entry:
+        if revoked_entry.revoked_reason == "REPLAY":
+            # Token was already revoked as replay - attack detected
+            await revoke_family(db, family_id, "REPLAY")
+            return RefreshResult.REPLAY_DETECTED, None, None, None, None
+        elif revoked_entry.revoked_reason == "ROTATION":
+            # Entry exists with ROTATION reason
+            if revoked_entry.family_id == family_id and revoked_entry.user_id == user.id:
+                # Our insert succeeded (or legitimate concurrent rotation that we serialized via lock)
+                # The SELECT FOR UPDATE NOWAIT lock ensures only one request per family at a time
+                # So this is our insert - proceed with rotation
+                pass
+            else:
+                # Different family/user - shouldn't happen but treat as replay
+                await revoke_family(db, family_id, "REPLAY")
+                return RefreshResult.REPLAY_DETECTED, None, None, None, None
 
     # b) Generate new tokens
     new_access_token = create_access_token(user.id, user.role)
