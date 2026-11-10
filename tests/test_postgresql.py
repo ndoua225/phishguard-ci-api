@@ -6,6 +6,7 @@ where PostgreSQL 16 is available as a service.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 import pytest_asyncio
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.auth import RevokedRefreshToken
+from app.db.session import close_db, get_session_dependency, set_test_engine
 from app.main import create_app
 from app.models import Base
 
@@ -27,12 +29,10 @@ pytestmark = pytest.mark.postgresql
 @pytest_asyncio.fixture(scope="function")
 async def pg_engine():
     """Create PostgreSQL engine for testing."""
-    # This will use the CI environment variable
-    import os
     db_url = os.environ.get("PHISHGUARD_DATABASE_URL")
     if not db_url or not db_url.startswith("postgresql"):
         pytest.skip("PostgreSQL not available")
-    
+
     engine = create_async_engine(db_url, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -43,19 +43,25 @@ async def pg_engine():
 @pytest_asyncio.fixture(scope="function")
 async def pg_app(pg_engine):
     """Create app with PostgreSQL."""
+    # Set the global test engine BEFORE creating the app
+    # This ensures the app uses the same engine as the test fixtures
+    set_test_engine(str(pg_engine.url))
+
+    app = create_app(database_url=None)
+
     async_session = sessionmaker(pg_engine, class_=AsyncSession, expire_on_commit=False)
-    
-    app = create_app(database_url=str(pg_engine.url))
-    
+
     async def override_get_session():
         async with async_session() as session:
             yield session
-    
-    app.dependency_overrides[__import__('app.db.session', fromlist=['get_session_dependency']).get_session_dependency] = override_get_session
-    
+
+    app.dependency_overrides[get_session_dependency] = override_get_session
+
     yield app
-    
+
     app.dependency_overrides.clear()
+    # Clean up the global engine after test
+    await close_db()
 
 
 @pytest_asyncio.fixture(scope="function")
