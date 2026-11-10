@@ -63,20 +63,14 @@ jobs:
           PHISHGUARD_SECRET_KEY: test-secret-key-for-ci-testing-purposes-only-32chars
           PHISHGUARD_TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
         run: |
-          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard" \
-          PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars" \
-          PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=" \
-          python -m alembic upgrade head
+          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard"           PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars"           PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="           python -m alembic upgrade head
       - name: Run integration tests on PostgreSQL
         env:
           PHISHGUARD_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard
           PHISHGUARD_SECRET_KEY: test-secret-key-for-ci-testing-purposes-only-32chars
           PHISHGUARD_TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
         run: |
-          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard" \
-          PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars" \
-          PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=" \
-          python -m pytest tests/test_integration.py -v --tb=long 2>&1 | tee test_integration_output.txt
+          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard"           PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars"           PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="           python -m pytest tests/test_integration.py -v --tb=long 2>&1 | tee test_integration_output.txt
       - name: Run PostgreSQL-specific tests
         if: always()
         env:
@@ -84,10 +78,7 @@ jobs:
           PHISHGUARD_SECRET_KEY: test-secret-key-for-ci-testing-purposes-only-32chars
           PHISHGUARD_TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
         run: |
-          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard" \
-          PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars" \
-          PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=" \
-          python -m pytest tests/test_postgresql.py -v --tb=long 2>&1 | tee test_postgresql_output.txt
+          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard"           PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars"           PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="           python -m pytest tests/test_postgresql.py -v --tb=long 2>&1 | tee test_postgresql_output.txt
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -102,23 +93,27 @@ jobs:
           PHISHGUARD_SECRET_KEY: test-secret-key-for-ci-testing-purposes-only-32chars
           PHISHGUARD_TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
         run: |
-          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard" \
-          PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars" \
-          PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=" \
-          python -m alembic downgrade -1 && python -m alembic upgrade head
+          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard"           PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars"           PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="           python -m alembic downgrade -1 && python -m alembic upgrade head
       - name: Verify constraints and indexes
         env:
           PHISHGUARD_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard
           PHISHGUARD_SECRET_KEY: test-secret-key-for-ci-testing-purposes-only-32chars
           PHISHGUARD_TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ users"
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ sessions"
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ analyses"
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ analysis_results"
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ api_usage"
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ activity_logs"
-          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ system_config"
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ users" 2>&1 | tee verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ sessions" 2>&1 | tee -a verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ analyses" 2>&1 | tee -a verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ analysis_results" 2>&1 | tee -a verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ api_usage" 2>&1 | tee -a verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ activity_logs" 2>&1 | tee -a verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ system_config" 2>&1 | tee -a verify_output.txt
+          PGPASSWORD=postgres psql -h localhost -U postgres -d phishguard -c "\d+ revoked_refresh_tokens" 2>&1 | tee -a verify_output.txt
+      - name: Upload verify logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-logs
+          path: verify_output.txt
 
   secrets:
     runs-on: ubuntu-latest
