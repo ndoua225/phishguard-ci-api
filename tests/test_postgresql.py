@@ -88,11 +88,12 @@ class TestConcurrentRefresh:
         await pg_session.commit()
         await pg_session.refresh(user)
         
-        # Login to get refresh token
-        login_resp = await pg_client.post("/api/v1/auth/login", json={
-            "email": "concurrent@example.com", 
-            "password": "Test123!"
-        })
+        # Login to get refresh token (Bearer mode)
+        login_resp = await pg_client.post(
+            "/api/v1/auth/login", 
+            json={"email": "concurrent@example.com", "password": "Test123!"},
+            headers={"X-Auth-Mode": "bearer"}
+        )
         assert login_resp.status_code == 200
         
         # Get refresh token (Bearer mode)
@@ -176,11 +177,12 @@ class TestConcurrentRefresh:
         await pg_session.commit()
         await pg_session.refresh(user)
         
-        # Login
-        login_resp = await pg_client.post("/api/v1/auth/login", json={
-            "email": "replay@example.com", 
-            "password": "Test123!"
-        })
+        # Login (Bearer mode)
+        login_resp = await pg_client.post(
+            "/api/v1/auth/login", 
+            json={"email": "replay@example.com", "password": "Test123!"},
+            headers={"X-Auth-Mode": "bearer"}
+        )
         assert login_resp.status_code == 200
         old_refresh = login_resp.json()["refresh_token"]
         
