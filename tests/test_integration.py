@@ -1,9 +1,12 @@
 """Integration tests for PhishGuard CI API.
 
-These tests use an in-memory SQLite database for isolation.
+These tests use an in-memory SQLite database for isolation by default,
+but can run against PostgreSQL when PHISHGUARD_DATABASE_URL is set.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 import pytest_asyncio
@@ -16,8 +19,8 @@ from app.db.session import get_session_dependency
 from app.main import create_app
 from app.models import Base
 
-# Override settings for testing
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+# Use PostgreSQL from environment if available (for CI), otherwise SQLite
+TEST_DATABASE_URL = os.environ.get("PHISHGUARD_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 @pytest_asyncio.fixture(scope="function")
