@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, AsyncConnection, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.session import get_session_dependency
@@ -21,6 +21,9 @@ from app.models import Base
 
 # Use PostgreSQL from environment if available (for CI), otherwise SQLite
 TEST_DATABASE_URL = os.environ.get("PHISHGUARD_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
+# Detect if we're using PostgreSQL (needs transaction isolation)
+IS_POSTGRESQL = TEST_DATABASE_URL.startswith("postgresql")
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -33,22 +36,44 @@ async def test_engine():
 
 
 @pytest_asyncio.fixture(scope="function")
-async def app(test_engine):
-    
-    app = create_app(database_url=TEST_DATABASE_URL)
-    
+async def db_connection(test_engine):
+    """Provide a database connection with transaction isolation for PostgreSQL."""
+    if IS_POSTGRESQL:
+        # For PostgreSQL: use a dedicated connection with transaction rollback
+        async with test_engine.connect() as conn:
+            trans = await conn.begin()
+            try:
+                yield conn
+            finally:
+                await trans.rollback()
+    else:
+        # For SQLite: just yield a connection (each test gets fresh DB)
+        async with test_engine.connect() as conn:
+            yield conn
 
-    
-    async_session = sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-    
+
+@pytest_asyncio.fixture(scope="function")
+async def db_session(db_connection: AsyncConnection):
+    """Provide a session bound to the test connection/transaction."""
+    session_factory = sessionmaker(db_connection, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
+
+
+@pytest_asyncio.fixture(scope="function")
+async def app(test_engine, db_connection):
+    app = create_app(database_url=TEST_DATABASE_URL)
+
     async def override_get_session():
-        async with async_session() as session:
+        # Use the transaction-bound session
+        session_factory = sessionmaker(db_connection, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
             yield session
-    
+
     app.dependency_overrides[get_session_dependency] = override_get_session
-    
+
     yield app
-    
+
     app.dependency_overrides.clear()
 
 
@@ -124,25 +149,25 @@ class TestAuth:
         assert "already registered" in response.json()["detail"].lower()
 
     async def test_login_success(self, client, registered_user):
-            # Get login CSRF token first
-            csrf_response = await client.get("/api/v1/auth/login/csrf")
-            assert csrf_response.status_code == 200
-            login_csrf_token = csrf_response.cookies.get("login_csrf")
+        # Get login CSRF token first
+        csrf_response = await client.get("/api/v1/auth/login/csrf")
+        assert csrf_response.status_code == 200
+        login_csrf_token = csrf_response.cookies.get("login_csrf")
 
-            response = await client.post(
-                "/api/v1/auth/login",
-                json={"email": registered_user["email"], "password": registered_user["password"]},
-                headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
-            )
-            assert response.status_code == 200
-            data = response.json()
-            assert "access_token" in data
-            assert "refresh_token" not in data  # In cookie mode, refresh_token is in cookie
-            assert data["token_type"] == "bearer"
-            assert "user" in data
-            assert "session" in response.cookies
-            assert "csrf_token" in response.cookies
-            assert "refresh_token" in response.cookies
+        response = await client.post(
+            "/api/v1/auth/login",
+            json={"email": registered_user["email"], "password": registered_user["password"]},
+            headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "access_token" in data
+        assert "refresh_token" not in data  # In cookie mode, refresh_token is in cookie
+        assert data["token_type"] == "bearer"
+        assert "user" in data
+        assert "session" in response.cookies
+        assert "csrf_token" in response.cookies
+        assert "refresh_token" in response.cookies
 
     async def test_login_wrong_password(self, client, registered_user):
         # Get login CSRF token first
@@ -172,27 +197,27 @@ class TestAuth:
 
     async def test_logout(self, client, registered_user):
         response = await client.post(
-    "/api/v1/auth/logout",
-    headers=auth_headers(registered_user["access_token"]),
+            "/api/v1/auth/logout",
+            headers=auth_headers(registered_user["access_token"]),
         )
         assert response.status_code == 200
         # Note: JWT tokens are stateless, logout only clears cookies
         # The token is still valid until expiry
 
     async def test_refresh_token(self, client, registered_user):
-            # Refresh using refresh token from cookie
-            refresh_token = registered_user["refresh_token"]
-            csrf_token = registered_user["csrf_token"]
+        # Refresh using refresh token from cookie
+        refresh_token = registered_user["refresh_token"]
+        csrf_token = registered_user["csrf_token"]
 
-            response = await client.post(
-                "/api/v1/auth/refresh",
-                cookies={"refresh_token": refresh_token} if refresh_token else {},
-                headers={"X-CSRF-Token": csrf_token} if csrf_token else {},
-            )
-            assert response.status_code == 200
-            data = response.json()
-            assert "access_token" in data
-            assert data["token_type"] == "bearer"
+        response = await client.post(
+            "/api/v1/auth/refresh",
+            cookies={"refresh_token": refresh_token} if refresh_token else {},
+            headers={"X-CSRF-Token": csrf_token} if csrf_token else {},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "access_token" in data
+        assert data["token_type"] == "bearer"
 
 
 class TestCSRF:
@@ -217,7 +242,7 @@ class TestCSRF:
 class TestQuotas:
     async def test_quota_enforced(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         response = await client.get("/api/v1/auth/me/quota", headers=headers)
         assert response.status_code == 200
         data = response.json()
@@ -229,7 +254,7 @@ class TestQuotas:
 class TestAnalyses:
     async def test_create_analysis(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         response = await client.post(
             "/api/v1/analyses",
             json={"content": "Test message with http://example.com link", "content_type": "MESSAGE"},
@@ -245,7 +270,7 @@ class TestAnalyses:
 
     async def test_create_analysis_too_long(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         long_content = "x" * 2000
         response = await client.post(
             "/api/v1/analyses",
@@ -256,13 +281,13 @@ class TestAnalyses:
 
     async def test_list_analyses(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         await client.post(
             "/api/v1/analyses",
             json={"content": "Test message", "content_type": "MESSAGE"},
             headers=headers,
         )
-        
+
         response = await client.get("/api/v1/analyses", headers=headers)
         assert response.status_code == 200
         data = response.json()
@@ -271,14 +296,14 @@ class TestAnalyses:
 
     async def test_get_analysis(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         create_response = await client.post(
             "/api/v1/analyses",
             json={"content": "Test message for get", "content_type": "MESSAGE"},
             headers=headers,
         )
         analysis_ref = create_response.json()["analysis_ref"]
-        
+
         response = await client.get(f"/api/v1/analyses/{analysis_ref}", headers=headers)
         assert response.status_code == 200
         data = response.json()
@@ -286,17 +311,17 @@ class TestAnalyses:
 
     async def test_delete_analysis(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         create_response = await client.post(
             "/api/v1/analyses",
             json={"content": "Test message for delete", "content_type": "MESSAGE"},
             headers=headers,
         )
         analysis_ref = create_response.json()["analysis_ref"]
-        
+
         response = await client.delete(f"/api/v1/analyses/{analysis_ref}", headers=headers)
         assert response.status_code == 204
-        
+
         response = await client.get(f"/api/v1/analyses/{analysis_ref}", headers=headers)
         assert response.status_code == 404
 
@@ -304,7 +329,7 @@ class TestAnalyses:
 class TestDashboard:
     async def test_user_stats(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         response = await client.get("/api/v1/dashboard/user/stats", headers=headers)
         assert response.status_code == 200
         data = response.json()
@@ -315,7 +340,7 @@ class TestDashboard:
 
     async def test_user_recent(self, client, registered_user):
         headers = auth_headers(registered_user["access_token"])
-        
+
         response = await client.get("/api/v1/dashboard/user/recent", headers=headers)
         assert response.status_code == 200
         data = response.json()
