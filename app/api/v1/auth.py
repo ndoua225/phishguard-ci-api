@@ -166,17 +166,28 @@ async def login(
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalar_one_or_none()
 
+    # Check if account is locked due to failed login attempts
+    if user and user.locked_until and user.locked_until > datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Please try again later.",
+        )
+
     if not user or not verify_password(request.password, user.password_hash):
         # Increment failed attempts
         if user:
             user.failed_login_attempts += 1
             if user.failed_login_attempts >= 5:
-                user.locked_until = datetime.now(UTC)
+                user.locked_until = datetime.now(UTC) + timedelta(minutes=15)
             await db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
         )
+
+    # Reset failed attempts on successful login
+    user.failed_login_attempts = 0
+    user.locked_until = None
 
     if not user.is_active:
         raise HTTPException(
