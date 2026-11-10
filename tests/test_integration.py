@@ -15,7 +15,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.db.session import get_session_dependency
+from app.db.session import close_db, get_session_dependency, set_test_engine
 from app.main import create_app
 from app.models import Base
 
@@ -70,7 +70,12 @@ async def shared_session(db_connection: AsyncConnection):
 
 @pytest_asyncio.fixture(scope="function")
 async def app(test_engine, db_connection, shared_session):
-    app = create_app(database_url=TEST_DATABASE_URL)
+    # Set the global test engine BEFORE creating the app
+    # This ensures the app uses the same engine as the test fixtures
+    set_test_engine(str(test_engine.url))
+    
+    # Create app WITHOUT database_url to avoid re-initializing the engine in lifespan
+    app = create_app(database_url=None)
 
     async def override_get_session():
         # Return the shared session for all requests in this test
@@ -81,6 +86,8 @@ async def app(test_engine, db_connection, shared_session):
     yield app
 
     app.dependency_overrides.clear()
+    # Clean up the global engine after test
+    await close_db()
 
 
 @pytest_asyncio.fixture(scope="function")
