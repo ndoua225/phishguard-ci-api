@@ -73,3 +73,6 @@ mypy_path = "."
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+markers = [
+    "postgresql: marks tests requiring PostgreSQL (skipped without PG env)",
+]
