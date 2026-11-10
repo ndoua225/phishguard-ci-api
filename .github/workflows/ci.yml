@@ -76,7 +76,26 @@ jobs:
           PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard" \
           PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars" \
           PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=" \
-          python -m pytest tests/test_integration.py tests/test_postgresql.py -v
+          python -m pytest tests/test_integration.py -v --tb=long 2>&1 | tee test_integration_output.txt
+      - name: Run PostgreSQL-specific tests
+        if: always()
+        env:
+          PHISHGUARD_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard
+          PHISHGUARD_SECRET_KEY: test-secret-key-for-ci-testing-purposes-only-32chars
+          PHISHGUARD_TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+        run: |
+          PHISHGUARD_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard" \
+          PHISHGUARD_SECRET_KEY="test-secret-key-for-ci-testing-purposes-only-32chars" \
+          PHISHGUARD_TOTP_ENCRYPTION_KEY="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=" \
+          python -m pytest tests/test_postgresql.py -v --tb=long 2>&1 | tee test_postgresql_output.txt
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            test_integration_output.txt
+            test_postgresql_output.txt
       - name: Test Alembic downgrade/upgrade
         env:
           PHISHGUARD_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard
