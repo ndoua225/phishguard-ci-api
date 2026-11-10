@@ -17,7 +17,12 @@ from app.models import Base
 config = context.config
 
 # Override sqlalchemy.url with settings value (supports env var override)
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# For Alembic migrations, we need a synchronous driver (psycopg2) even if the app uses asyncpg
+database_url = settings.database_url
+if database_url.startswith("postgresql+asyncpg://"):
+    # Convert async URL to synchronous for Alembic migrations
+    database_url = database_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
+config.set_main_option("sqlalchemy.url", database_url)
 
 # For autogenerate without a live database, use a synchronous URL
 # This allows alembic to inspect the metadata and generate migrations
