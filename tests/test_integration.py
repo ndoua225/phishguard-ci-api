@@ -53,22 +53,28 @@ async def db_connection(test_engine):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def db_session(db_connection: AsyncConnection):
-    """Provide a session bound to the test connection/transaction."""
+async def shared_session(db_connection: AsyncConnection):
+    """Provide a single session shared across all requests in a test.
+
+    This session is bound to the test connection and participates in the
+    test's transaction. It is NOT closed until the test ends, allowing
+    data to persist across multiple requests within the same test.
+    """
     session_factory = sessionmaker(db_connection, class_=AsyncSession, expire_on_commit=False)
-    async with session_factory() as session:
+    session = session_factory()
+    try:
         yield session
+    finally:
+        await session.close()
 
 
 @pytest_asyncio.fixture(scope="function")
-async def app(test_engine, db_connection):
+async def app(test_engine, db_connection, shared_session):
     app = create_app(database_url=TEST_DATABASE_URL)
 
     async def override_get_session():
-        # Use the transaction-bound session
-        session_factory = sessionmaker(db_connection, class_=AsyncSession, expire_on_commit=False)
-        async with session_factory() as session:
-            yield session
+        # Return the shared session for all requests in this test
+        yield shared_session
 
     app.dependency_overrides[get_session_dependency] = override_get_session
 
