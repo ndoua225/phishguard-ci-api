@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -11,25 +12,34 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import (
+    AuthMode,
+    RefreshResult,
     clear_auth_cookies,
+    clear_login_csrf_cookie,
     create_access_token,
     create_refresh_token,
     create_user_session,
     delete_all_user_sessions,
     delete_session,
+    detect_auth_mode,
+    generate_csrf_token,
     generate_totp_secret,
     get_current_user,
     get_totp_provisioning_uri,
     hash_password,
+    hash_token,
     require_admin,
     require_super_admin,
+    rotate_refresh_token,
     set_auth_cookies,
+    set_login_csrf_cookie,
     validate_csrf_token,
+    validate_login_csrf,
     verify_password,
     verify_totp_code,
 )
 from app.db.session import get_session_dependency
-from app.models import User, UserRole
+from app.models import Session, User, UserRole
 from app.services.quota_service import get_user_quota_status
 
 __all__ = [
@@ -199,6 +209,13 @@ async def login(
     else:
         mfa_verified = True
 
+    # Detect auth mode
+    mode = detect_auth_mode(http_request, "login")
+
+    # Validate login CSRF for cookie mode
+    if mode == AuthMode.COOKIE:
+        await validate_login_csrf(http_request)
+
     # Create session
     session_token, csrf_token = await create_user_session(
         db, user, http_request, mfa_verified=mfa_verified
@@ -208,16 +225,51 @@ async def login(
     access_token = create_access_token(user.id, user.role)
     refresh_token = create_refresh_token(user.id)
 
-    # Set cookies
-    secure = http_request.url.scheme == "https"
-    set_auth_cookies(response, session_token, csrf_token, secure=secure)
+    # Update session with refresh token hash
+    refresh_token_hash = hash_token(refresh_token)
+    result = await db.execute(
+        select(Session).where(Session.user_id == user.id, Session.session_token_hash == hash_token(session_token))
+    )
+    session_obj = cast("Session | None", result.scalar_one_or_none())
+    if session_obj:
+        session_obj.refresh_token_hash = hash_token(refresh_token)
+        await db.commit()
 
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "user": UserResponse.model_validate(user),
-    }
+    # Set cookies based on mode
+    secure = http_request.url.scheme == "https"
+    if mode == AuthMode.COOKIE:
+        # Cookie mode: set all cookies, don't return refresh_token in JSON
+        set_auth_cookies(response, session_token, csrf_token, refresh_token, secure=secure)
+        # Clear login CSRF cookie after successful login
+        clear_login_csrf_cookie(response)
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": UserResponse.model_validate(user),
+        }
+    else:
+        # Bearer mode: return refresh_token in JSON, don't set cookies
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "user": UserResponse.model_validate(user),
+        }
+
+    # Should never reach here, but safeguard
+    raise HTTPException(status_code=500, detail="Login failed unexpectedly")
+
+
+@router.get("/login/csrf")
+async def get_login_csrf(
+    response: Response,
+    http_request: Request,
+) -> dict[str, str]:
+    """Get a login CSRF token for the login form."""
+    csrf_token = generate_csrf_token()
+    secure = http_request.url.scheme == "https"
+    set_login_csrf_cookie(response, csrf_token, secure=secure)
+    return {"csrf_token": csrf_token}
 
 
 @router.post("/logout")
@@ -240,48 +292,103 @@ async def logout(
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_session_dependency),
 ) -> TokenResponse:
-    """Refresh access token using refresh token."""
-    # Get refresh token from cookie or header
-    refresh_token = request.cookies.get("refresh_token")
-    if not refresh_token:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            refresh_token = auth_header[7:]
+    """Refresh access token using refresh token with rotation."""
+    mode = detect_auth_mode(request, "refresh")
 
-    if not refresh_token:
+    if mode == AuthMode.COOKIE:
+        refresh_token = request.cookies.get("refresh_token")
+        if not refresh_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token required in cookie",
+            )
+        await validate_csrf_token(request, db)
+
+    elif mode == AuthMode.BEARER:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token required in Authorization header",
+            )
+        refresh_token = auth_header[7:]
+        if not refresh_token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Empty Bearer token",
+            )
+    else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token required",
+            detail="Authentication required: provide Bearer header or refresh_token cookie",
         )
 
+    # Validate token
     from app.core.auth import decode_token
 
     payload = decode_token(refresh_token)
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token",
+            detail="Invalid token type",
         )
+
+    # Verify exp claim
+        exp_timestamp = payload.get("exp")
+        if exp_timestamp is None or datetime.fromtimestamp(float(exp_timestamp), UTC) < datetime.now(UTC):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token expired",
+            )
 
     user_id = UUID(payload["sub"])
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
 
-    access_token = create_access_token(user.id, user.role)
-    new_refresh_token = create_refresh_token(user.id)
+    # Find session by refresh token hash
+    from app.core.auth import hash_token
 
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=new_refresh_token,
+    result = await db.execute(
+        select(Session).where(
+        Session.user_id == user_id, Session.refresh_token_hash == hash_token(refresh_token)
     )
+    )
+    session = cast("Session | None", result.scalar_one_or_none())
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session not found for refresh token",
+        )
+
+    # Rotate refresh token
+    rotate_result, access_token, new_refresh_token, new_session_token, new_csrf_token = await rotate_refresh_token(
+    db, refresh_token, user, session.family_id
+    )
+
+    if rotate_result != RefreshResult.SUCCESS:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Refresh failed: {rotate_result.value}",
+        )
+
+    # Set new cookies for cookie mode
+    if detect_auth_mode(request, "refresh") == AuthMode.COOKIE:
+        secure = request.url.scheme == "https"
+        # These are guaranteed non-None when result == SUCCESS
+        new_session_token_str = new_session_token or ""
+        new_csrf_token_str = new_csrf_token or ""
+        new_refresh_token_str = new_refresh_token or ""
+        set_auth_cookies(response, new_session_token_str, new_csrf_token_str, new_refresh_token_str, secure=secure)
+
+    return TokenResponse(access_token=access_token, refresh_token="", token_type="bearer")
 
 
 @router.get("/me", response_model=UserResponse)

@@ -67,17 +67,29 @@ async def registered_user(client):
     }
     response = await client.post("/api/v1/auth/register", json=user_data)
     assert response.status_code == 201
-    
-    # Log in to get access token
-    login_response = await client.post("/api/v1/auth/login", json=user_data)
+
+    # Get login CSRF token first
+    csrf_response = await client.get("/api/v1/auth/login/csrf")
+    assert csrf_response.status_code == 200
+    login_csrf_token = csrf_response.cookies.get("login_csrf")
+
+    # Log in to get access token (with login CSRF)
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        json=user_data,
+        headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
+    )
     assert login_response.status_code == 200
     login_data = login_response.json()
-    
+
+    # In cookie mode, refresh_token is in the cookie, not in JSON
+    refresh_token = login_response.cookies.get("refresh_token")
+
     return {
         "email": user_data["email"],
         "password": user_data["password"],
         "access_token": login_data["access_token"],
-        "refresh_token": login_data["refresh_token"],
+        "refresh_token": refresh_token,
         "csrf_token": login_response.cookies.get("csrf_token"),
     }
 
@@ -109,58 +121,88 @@ class TestAuth:
         assert "already registered" in response.json()["detail"].lower()
 
     async def test_login_success(self, client, registered_user):
-        response = await client.post(
-            "/api/v1/auth/login",
-            json={"email": registered_user["email"], "password": registered_user["password"]},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "access_token" in data
-        assert "refresh_token" in data
-        assert data["token_type"] == "bearer"
-        assert "user" in data
-        assert "session" in response.cookies
-        assert "csrf_token" in response.cookies
+            # Get login CSRF token first
+            csrf_response = await client.get("/api/v1/auth/login/csrf")
+            assert csrf_response.status_code == 200
+            login_csrf_token = csrf_response.cookies.get("login_csrf")
+
+            response = await client.post(
+                "/api/v1/auth/login",
+                json={"email": registered_user["email"], "password": registered_user["password"]},
+                headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert "access_token" in data
+            assert "refresh_token" not in data  # In cookie mode, refresh_token is in cookie
+            assert data["token_type"] == "bearer"
+            assert "user" in data
+            assert "session" in response.cookies
+            assert "csrf_token" in response.cookies
+            assert "refresh_token" in response.cookies
 
     async def test_login_wrong_password(self, client, registered_user):
+        # Get login CSRF token first
+        csrf_response = await client.get("/api/v1/auth/login/csrf")
+        assert csrf_response.status_code == 200
+        login_csrf_token = csrf_response.cookies.get("login_csrf")
+
         response = await client.post(
             "/api/v1/auth/login",
             json={"email": registered_user["email"], "password": "WrongPassword123!"},
+            headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
         )
         assert response.status_code == 401
 
     async def test_login_nonexistent_user(self, client):
+        # Get login CSRF token first
+        csrf_response = await client.get("/api/v1/auth/login/csrf")
+        assert csrf_response.status_code == 200
+        login_csrf_token = csrf_response.cookies.get("login_csrf")
+
         response = await client.post(
             "/api/v1/auth/login",
             json={"email": "nonexistent@example.com", "password": "Password123!"},
+            headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
         )
         assert response.status_code == 401
 
     async def test_logout(self, client, registered_user):
         response = await client.post(
-            "/api/v1/auth/logout",
-            headers=auth_headers(registered_user["access_token"]),
+    "/api/v1/auth/logout",
+    headers=auth_headers(registered_user["access_token"]),
         )
         assert response.status_code == 200
         # Note: JWT tokens are stateless, logout only clears cookies
         # The token is still valid until expiry
 
     async def test_refresh_token(self, client, registered_user):
-        # Refresh using refresh token from cookie or header
-        refresh_token = registered_user["refresh_token"]
-        
-        response = await client.post(
-            "/api/v1/auth/refresh",
-            cookies={"refresh_token": refresh_token} if refresh_token else {},
-        )
-        assert response.status_code in (200, 401)
+            # Refresh using refresh token from cookie
+            refresh_token = registered_user["refresh_token"]
+            csrf_token = registered_user["csrf_token"]
+
+            response = await client.post(
+                "/api/v1/auth/refresh",
+                cookies={"refresh_token": refresh_token} if refresh_token else {},
+                headers={"X-CSRF-Token": csrf_token} if csrf_token else {},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert "access_token" in data
+            assert data["token_type"] == "bearer"
 
 
 class TestCSRF:
     async def test_csrf_token_on_login(self, client, registered_user):
+        # Get login CSRF token first
+        csrf_response = await client.get("/api/v1/auth/login/csrf")
+        assert csrf_response.status_code == 200
+        login_csrf_token = csrf_response.cookies.get("login_csrf")
+
         response = await client.post(
             "/api/v1/auth/login",
             json={"email": registered_user["email"], "password": registered_user["password"]},
+            headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
         )
         assert "csrf_token" in response.cookies
 
@@ -281,32 +323,48 @@ class TestDataIsolation:
     async def test_user_cannot_access_other_analysis(self, client):
         user1 = {"email": "user1@example.com", "password": "Password123!"}
         user2 = {"email": "user2@example.com", "password": "Password123!"}
-        
+
         await client.post("/api/v1/auth/register", json=user1)
         await client.post("/api/v1/auth/register", json=user2)
-        
+
         # Login as user1
-        login1 = await client.post("/api/v1/auth/login", json=user1)
+        csrf_response = await client.get("/api/v1/auth/login/csrf")
+        assert csrf_response.status_code == 200
+        login_csrf_token = csrf_response.cookies.get("login_csrf")
+
+        login1 = await client.post(
+            "/api/v1/auth/login",
+            json=user1,
+            headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
+        )
         assert login1.status_code == 200
         user1_token = login1.json()["access_token"]
         headers1 = auth_headers(user1_token)
-        
+
         create_response = await client.post(
             "/api/v1/analyses",
             json={"content": "User1 private message", "content_type": "MESSAGE"},
             headers=headers1,
         )
         analysis_ref = create_response.json()["analysis_ref"]
-        
+
         # Login as user2
-        login2 = await client.post("/api/v1/auth/login", json=user2)
+        csrf_response = await client.get("/api/v1/auth/login/csrf")
+        assert csrf_response.status_code == 200
+        login_csrf_token = csrf_response.cookies.get("login_csrf")
+
+        login2 = await client.post(
+            "/api/v1/auth/login",
+            json=user2,
+            headers={"X-CSRF-Token": login_csrf_token} if login_csrf_token else {},
+        )
         assert login2.status_code == 200
         user2_token = login2.json()["access_token"]
         headers2 = auth_headers(user2_token)
-        
+
         response = await client.get(f"/api/v1/analyses/{analysis_ref}", headers=headers2)
         assert response.status_code == 404
-        
+
         response = await client.delete(f"/api/v1/analyses/{analysis_ref}", headers=headers2)
         assert response.status_code == 404
 

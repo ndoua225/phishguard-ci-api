@@ -137,7 +137,7 @@
           "auth"
         ],
         "summary": "Refresh Token",
-        "description": "Refresh access token using refresh token.",
+        "description": "Refresh access token using refresh token with rotation.",
         "operationId": "refresh_token_api_v1_auth_refresh_post",
         "responses": {
           "200": {

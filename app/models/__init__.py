@@ -141,8 +141,22 @@ class Session(Base):
     user_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    session_token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    # Opaque tokens - stored as SHA-256 hashes
+    session_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     csrf_token: Mapped[str] = mapped_column(String(255), nullable=False)
+    refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Token family for rotation tracking
+    family_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False, index=True
+    )
+    family_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    family_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    # Legacy field - will be removed after migration
+    session_token: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True, index=True)
     ip_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -158,6 +172,35 @@ class Session(Base):
 
     # Relationships
     user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class RevokedRefreshToken(Base):
+    """Blacklist of revoked refresh tokens for replay detection."""
+
+    __tablename__ = "revoked_refresh_tokens"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    family_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False, index=True
+    )
+    revoked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    revoked_reason: Mapped[str] = mapped_column(String(64), nullable=False)  # ROTATION, LOGOUT, REPLAY, ADMIN
+    original_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_revoked_family_revoked", "family_id", "revoked_at"),
+        Index("ix_revoked_user_revoked", "user_id", "revoked_at"),
+    )
 
 
 class Analysis(Base):
