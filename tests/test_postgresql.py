@@ -276,6 +276,10 @@ class TestMigrationDowngradeUpgrade:
         """Verify downgrade then upgrade preserves schema."""
         import os
         import subprocess
+        from pathlib import Path
+        
+        # Get repository root dynamically
+        repo_root = Path(__file__).parent.parent
         
         # Run downgrade
         result = subprocess.run(
@@ -283,7 +287,7 @@ class TestMigrationDowngradeUpgrade:
             env={**os.environ, "PHISHGUARD_DATABASE_URL": str(pg_session.bind.url)},
             capture_output=True,
             text=True,
-            cwd="/c/Users/Stanislas/Projects/phishguard-ci-api"
+            cwd=str(repo_root),
         )
         assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
         
@@ -299,7 +303,7 @@ class TestMigrationDowngradeUpgrade:
             env={**os.environ, "PHISHGUARD_DATABASE_URL": str(pg_session.bind.url)},
             capture_output=True,
             text=True,
-            cwd="/c/Users/Stanislas/Projects/phishguard-ci-api"
+            cwd=str(repo_root),
         )
         assert result.returncode == 0, f"Upgrade failed: {result.stderr}"
         
